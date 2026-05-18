@@ -11,7 +11,7 @@ import boto3
 log = logging.getLogger(__name__)
 
 REGION = "us-east-1"
-MODEL_ID = "anthropic.claude-haiku-4-5-20251001"
+MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 # ── Slot schema ───────────────────────────────────────────────────
 # Edit this to match your business requirements.
@@ -24,7 +24,7 @@ SLOT_SCHEMA = {
         "customerMood": "Customer mood: positive|negative|null",
         "isHomeowner": "Whether customer is homeowner: true/false/null",
         "highElectricBill": "Whether electric bill is $100+: true/false/null",
-        "goodCreditScore": "Whether credit score is above 700: true/false/null",
+        "goodCreditScore": "Whether credit score is above 680: true/false/null",
         "wantsConsultation": "Whether customer wants consultation: true/false/null",
     },
     "optional": {
@@ -34,6 +34,7 @@ SLOT_SCHEMA = {
         "disqualifyReason": "Reason customer was disqualified if applicable",
     }
 }
+
 EXTRACTION_PROMPT = """You are an entity extraction system for a customer support call.
 
 Extract the following fields from the conversation transcript below.

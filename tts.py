@@ -10,7 +10,7 @@ import boto3
 log = logging.getLogger(__name__)
 
 REGION = "us-east-1"
-VOICE_ID = "Joanna"
+VOICE_ID = "Danielle"
 ENGINE = "neural"
 OUTPUT_FORMAT = "pcm"
 SAMPLE_RATE = "16000"
