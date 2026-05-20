@@ -46,7 +46,6 @@ class SessionManager:
                 "record_type": "SESSION",
                 "history": self._history,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-                "ttl": int(datetime.now(timezone.utc).timestamp()) + 86400
             })
         except Exception as e:
             log.warning(f"[Session {self.session_id}] DynamoDB save failed: {e}")
@@ -80,7 +79,6 @@ class SessionManager:
     def add_assistant_message(self, text: str):
         self._history.append({"role": "assistant", "content": text})
         self._trim_history()
-        self._save_history()  # Persist after each complete turn
 
     def get_history(self) -> list:
         return self._history.copy()

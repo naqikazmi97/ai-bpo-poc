@@ -125,6 +125,7 @@ class LLMStream:
       without waiting for the full response.
       """
       self.session.add_user_message(user_text)
+      log.info(f"[LLM] Full history being sent: {self.session.get_history()}")
       today = date.today().strftime("%B %d, %Y")
       system = SYSTEM_PROMPT.format(today=today)
       body = json.dumps({

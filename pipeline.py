@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 
 class VoicePipeline:
     def __init__(self, session_id: str, websocket: WebSocket):
+        
         self.session_id = session_id
         self.websocket = websocket
         self.session = SessionManager(session_id)
@@ -29,6 +30,7 @@ class VoicePipeline:
         self._asr_started = False
         self._current_bot_response = []
         self._extraction_done = False  # Guard: only extract once per session
+        self._bot_turn_lock = asyncio.Lock()
 
     # ── Public interface ──────────────────────────────────────────
 
@@ -68,6 +70,7 @@ class VoicePipeline:
         Called on disconnect (clean or abrupt).
         Runs extraction as safety net if end_session wasn't called.
         """
+        log.info(f"[{self.session_id}] cleanup called, already_ended={already_ended}")
         await self.asr.stop()
         await self.tts.stop()
 
@@ -90,16 +93,17 @@ class VoicePipeline:
         Transcribe produced a final utterance.
         Immediately start LLM streaming — don't wait.
         """
-        log.info(f"[{self.session_id}] User: {text}")
+        async with self._bot_turn_lock:
+            log.info(f"[{self.session_id}] User: {text}")
 
-        await self._send_control({
-            "type": "asr_result",
-            "text": text
-        })
+            await self._send_control({
+                "type": "asr_result",
+                "text": text
+            })
 
-        self._current_bot_response = []
-        await self.llm.stream_response(text)
-        await self._on_turn_complete()
+            self._current_bot_response = []
+            await self.llm.stream_response(text)
+            await self._on_turn_complete()
 
     async def _on_llm_sentence(self, sentence: str):
         """
@@ -125,15 +129,23 @@ class VoicePipeline:
         await self.websocket.send_text(json.dumps(payload))
 
     async def _on_turn_complete(self):
-        """Called when a full bot response is delivered."""
         full_response = " ".join(self._current_bot_response)
         self.session.add_assistant_message(full_response)
+        # Wait for TTS to finish synthesizing ALL sentences
+        try:
+            await asyncio.wait_for(self.tts._queue.join(), timeout=10.0)
+        except asyncio.TimeoutError:
+            log.warning(f"[{self.session_id}] TTS queue join timed out")
+        # Small buffer to ensure last audio chunk is sent to client
+        await asyncio.sleep(0.3)
         await self._send_control({"type": "turn_end"})
 
     async def bot_start(self):
-        await self._start_pipeline()
-        await self.llm.stream_response("START_CALL")
-
+        async with self._bot_turn_lock:
+            self.session.clear()
+            self.tts.start()
+            await self.llm.stream_response("START_CALL")
+            await self._on_turn_complete()
     # ── Extraction ─────────────────────────────────────────────────
 
     async def _extract_and_save(self):
@@ -161,3 +173,4 @@ class VoicePipeline:
             log.info(f"[{self.session_id}] Extraction complete: {slots}")
         except Exception as e:
             log.error(f"[{self.session_id}] Extraction failed: {e}", exc_info=True)
+
