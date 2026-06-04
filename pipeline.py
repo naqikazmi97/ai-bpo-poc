@@ -8,7 +8,7 @@ import json
 import logging
 from fastapi import WebSocket
 from asr import ASRStream
-from llm import LLMStream
+from llm import LLMStream, END_CALL_SENTINEL
 from tts import TTSStream
 from session import SessionManager
 
@@ -31,6 +31,7 @@ class VoicePipeline:
         self._current_bot_response = []
         self._extraction_done = False  # Guard: only extract once per session
         self._bot_turn_lock = asyncio.Lock()
+        self._bot_ending_call = False  # Set when LLM emits END_CALL sentinel
 
     # ── Public interface ──────────────────────────────────────────
 
@@ -53,15 +54,17 @@ class VoicePipeline:
         self._extraction_done = False
         log.info(f"[{self.session_id}] Session cleared")
 
-    async def end_session(self):
+    async def end_session(self, bot_initiated: bool = False):
         """
-        Explicit end_session from client (user pressed 'End Call').
+        Explicit end_session from client (user pressed 'End Call') or
+        bot-initiated (bot said goodbye).
         Runs extraction on full conversation, then saves.
         """
-        log.info(f"[{self.session_id}] Ending session — running extraction")
+        log.info(f"[{self.session_id}] Ending session — bot_initiated={bot_initiated}")
         await self._extract_and_save()
         await self._send_control({
             "type": "session_ended",
+            "bot_initiated": bot_initiated,
             "slots": self.session.get_slots()
         })
 
@@ -109,7 +112,14 @@ class VoicePipeline:
         """
         LLM produced a complete sentence.
         Queue for TTS immediately — don't wait for full LLM response.
+        If the END_CALL_SENTINEL arrives, trigger end_session once TTS drains.
         """
+        # Sentinel — not a real sentence, just a signal that the call is over.
+        if sentence == END_CALL_SENTINEL:
+            log.info(f"[{self.session_id}] END_CALL sentinel received — will end session after TTS drains")
+            self._bot_ending_call = True
+            return
+
         log.info(f"[{self.session_id}] LLM sentence: {sentence}")
         self._current_bot_response.append(sentence)
 
@@ -139,6 +149,12 @@ class VoicePipeline:
         # Small buffer to ensure last audio chunk is sent to client
         await asyncio.sleep(0.3)
         await self._send_control({"type": "turn_end"})
+
+        # If the bot's last response contained the closing phrase, end the session now.
+        if self._bot_ending_call:
+            self._bot_ending_call = False
+            log.info(f"[{self.session_id}] Bot-initiated end — running end_session automatically")
+            await self.end_session(bot_initiated=True)
 
     async def bot_start(self):
         async with self._bot_turn_lock:
@@ -173,4 +189,3 @@ class VoicePipeline:
             log.info(f"[{self.session_id}] Extraction complete: {slots}")
         except Exception as e:
             log.error(f"[{self.session_id}] Extraction failed: {e}", exc_info=True)
-

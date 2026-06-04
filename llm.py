@@ -117,6 +117,17 @@ END CALL.
 
 SENTENCE_ENDINGS = {'.', '?'}
 
+# Sentinel emitted after the bot's closing sentence so the pipeline
+# can trigger end_session automatically.
+END_CALL_SENTINEL = "__END_CALL__"
+
+# Phrases that indicate the bot has finished the call (Step 12).
+# Matched case-insensitively against the accumulated full response.
+END_CALL_PHRASES = [
+    "thank you for your time",
+    "have a great day",
+]
+
 
 class LLMStream:
     def __init__(self, session: SessionManager, on_sentence_ready):
@@ -165,6 +176,7 @@ class LLMStream:
             return
 
         sentence_buf = ""
+        full_response = ""
 
         for event in response["body"]:
             chunk = json.loads(event["chunk"]["bytes"])
@@ -177,6 +189,7 @@ class LLMStream:
                 continue
 
             sentence_buf += token
+            full_response += token
 
             # Detect sentence boundary
             if sentence_buf.rstrip() and sentence_buf.rstrip()[-1] in SENTENCE_ENDINGS:
@@ -193,5 +206,15 @@ class LLMStream:
         if sentence_buf.strip():
             asyncio.run_coroutine_threadsafe(
                 self.on_sentence_ready(sentence_buf.strip()),
+                loop
+            ).result(timeout=5.0)
+
+        # After all sentences are emitted, check if this was the closing turn.
+        # If so, send the sentinel so the pipeline can end the session.
+        full_response_lower = full_response.lower()
+        if any(phrase in full_response_lower for phrase in END_CALL_PHRASES):
+            log.info("[LLM] End-of-call phrase detected — emitting END_CALL sentinel")
+            asyncio.run_coroutine_threadsafe(
+                self.on_sentence_ready(END_CALL_SENTINEL),
                 loop
             ).result(timeout=5.0)
