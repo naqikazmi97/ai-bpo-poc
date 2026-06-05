@@ -32,6 +32,7 @@ class VoicePipeline:
         self._extraction_done = False  # Guard: only extract once per session
         self._bot_turn_lock = asyncio.Lock()
         self._bot_ending_call = False  # Set when LLM emits END_CALL sentinel
+        self._bot_speaking = False
 
     # ── Public interface ──────────────────────────────────────────
 
@@ -148,6 +149,7 @@ class VoicePipeline:
             log.warning(f"[{self.session_id}] TTS queue join timed out")
         # Small buffer to ensure last audio chunk is sent to client
         await asyncio.sleep(0.3)
+        self._bot_speaking = False
         await self._send_control({"type": "turn_end"})
 
         # If the bot's last response contained the closing phrase, end the session now.
@@ -160,6 +162,7 @@ class VoicePipeline:
         async with self._bot_turn_lock:
             self.session.clear()
             self.tts.start()
+            self._bot_speaking = True
             await self.llm.stream_response("START_CALL")
             await self._on_turn_complete()
     # ── Extraction ─────────────────────────────────────────────────

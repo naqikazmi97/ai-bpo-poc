@@ -36,6 +36,8 @@ class TTSStream:
         await self._queue.put(sentence)
 
     async def _worker(self):
+        pending_audio = None  # pre-fetched audio for next sentence
+
         while self._running:
             try:
                 sentence = await asyncio.wait_for(self._queue.get(), timeout=1.0)
@@ -46,9 +48,42 @@ class TTSStream:
                 break
 
             try:
-                audio = await asyncio.to_thread(self._synthesize_sync, sentence)
+                # Start synthesizing the NEXT sentence immediately in background
+                # so it's ready by the time this one finishes playing
+                next_task = None
+
+                # If we already pre-fetched audio for this sentence, use it
+                if pending_audio is not None:
+                    audio = pending_audio
+                    pending_audio = None
+                else:
+                    audio = await asyncio.to_thread(self._synthesize_sync, sentence)
+
+                # Peek at the next item in the queue and pre-fetch it in parallel
+                try:
+                    next_sentence = self._queue.get_nowait()
+                    if next_sentence is not None:
+                        next_task = asyncio.create_task(
+                            asyncio.to_thread(self._synthesize_sync, next_sentence)
+                        )
+                    else:
+                        self._queue.task_done()
+                except asyncio.QueueEmpty:
+                    next_sentence = None
+
+                # Play current audio while next is synthesizing in background
                 if audio:
                     await self.on_audio_ready(audio)
+
+                # Wait for pre-fetched audio and put it ready for next iteration
+                if next_task is not None:
+                    pending_audio = await next_task
+                    # Manually mark task_done for the peeked sentence
+                    self._queue.task_done()
+                    # Re-queue the pre-fetched sentence so the loop picks it up normally
+                    # but we already have its audio in pending_audio
+                    await self._queue.put(next_sentence)
+
             except Exception as e:
                 log.error(f"[TTS] Synthesis error: {e}")
             finally:

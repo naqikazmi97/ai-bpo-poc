@@ -12,8 +12,8 @@ from session import SessionManager
 log = logging.getLogger(__name__)
 
 REGION = "us-east-1"
-MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-MAX_TOKENS = 512
+MODEL_ID = "us.amazon.nova-micro-v1:0"
+MAX_TOKENS = 1000
 
 SYSTEM_PROMPT = """You are Tiffany, a friendly but professional outbound sales rep for Solar Solutions. Today's date is {today}. You are conducting a solar qualification call.
 
@@ -56,7 +56,7 @@ Acknowledge briefly and ask if there is a better time to call back.
 - They say no or say to continue → STEP 2
 
 STEP 2 — PURPOSE & ELECTRIC BILL:
-Say: "Great, the reason for my call is we're currently helping homeowners in your area see if they qualify for solar programs that can help reduce monthly electric bills, do you happen to know roughly what your average monthly electric bill is?"
+Say: "Great, the reason for my call is we're helping homeowners in your area qualify for solar programs that can lower their monthly electric bills. Do you happen to know roughly what your average monthly electric bill is?"
 - Yes or any amount $100 or above → Respond: "Wow, that is a high electric bill — and that's exactly why going solar could be the right move for you." Then continue to STEP 3.
 - No or any amount under $100 → "No problem at all, I appreciate your time. Have a great day." END
 
@@ -125,6 +125,8 @@ END_CALL_SENTINEL = "__END_CALL__"
 # Matched case-insensitively against the accumulated full response.
 END_CALL_PHRASES = [
     "thank you for your time",
+    "I hope your day gets better",
+    "I hope you have a great day",
     "have a great day",
 ]
 
@@ -134,6 +136,15 @@ class LLMStream:
         self.session = session
         self.on_sentence_ready = on_sentence_ready
         self._client = boto3.client("bedrock-runtime", region_name=REGION)
+
+    def _convert_history(self, history: list) -> list:
+        converted = []
+        for msg in history:
+            content = msg["content"]
+            if isinstance(content, str):
+                content = [{"text": content}]
+            converted.append({"role": msg["role"], "content": content})
+        return converted  # this line was missing
 
     async def stream_response(self, user_text: str):
       """
@@ -146,11 +157,12 @@ class LLMStream:
       today = date.today().strftime("%B %d, %Y")
       system = SYSTEM_PROMPT.format(today=today)
       body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": MAX_TOKENS,
-        "system": system,
-        "messages": self.session.get_history()
-      })
+        "messages": self._convert_history(self.session.get_history()),
+        "system": [{"text": system}],
+        "inferenceConfig": {
+            "max_new_tokens": MAX_TOKENS
+        }
+    })
       loop = asyncio.get_event_loop()
       await asyncio.to_thread(self._stream_sync, body, loop)
 
@@ -180,11 +192,11 @@ class LLMStream:
 
         for event in response["body"]:
             chunk = json.loads(event["chunk"]["bytes"])
-
-            if chunk.get("type") != "content_block_delta":
-                continue
-
-            token = chunk.get("delta", {}).get("text", "")
+            
+            # Nova format
+            token = (chunk.get("contentBlockDelta", {})
+                        .get("delta", {})
+                        .get("text", ""))
             if not token:
                 continue
 

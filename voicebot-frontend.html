@@ -240,29 +240,29 @@
     }
     .slot-complete-banner.show { display: flex; }
 
-    /* Next-call overlay — shown after session ends */
-    .next-call-overlay {
-      display: none;
-      position: absolute; inset: 0;
-      flex-direction: column; align-items: center; justify-content: center; gap: 14px;
-      background: rgba(13,15,18,0.93);
-      border-radius: var(--radius);
-      z-index: 10;
-    }
-    .next-call-overlay.show { display: flex; }
-    .next-call-overlay p { font-size: 13px; color: var(--text-muted); text-align: center; max-width: 260px; }
-    .next-call-overlay .call-ended-label {
-      font-size: 12px; font-weight: 600; text-transform: uppercase;
-      letter-spacing: 0.08em; color: var(--green);
-      display: flex; align-items: center; gap: 6px;
-    }
-    .next-call-btn {
-      padding: 12px 32px; border-radius: 24px; border: none;
-      background: var(--accent); color: #fff; font-size: 14px; font-weight: 600;
-      cursor: pointer; transition: background 0.2s;
-      display: flex; align-items: center; gap: 8px;
-    }
-    .next-call-btn:hover { background: #2563eb; }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     /* Session bar */
     .session-bar {
@@ -426,16 +426,14 @@
     </div>
 
     <!-- Next Call overlay — shown after a call ends -->
-    <div class="next-call-overlay" id="next-call-overlay">
-      <div class="call-ended-label">
+    <div class="next-call-overlay" id="next-call-overlay" style="display:none;position:absolute;inset:0;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(13,15,18,0.93);border-radius:var(--radius);z-index:10;">
+      <div style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--green);display:flex;align-items:center;gap:6px;">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
         Call Complete
       </div>
-      <p id="next-call-msg">Details have been saved. Ready for the next call.</p>
-      <button class="next-call-btn" id="next-call-btn">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.61 3.41 2 2 0 0 1 3.6 1.23h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 8.81a16 16 0 0 0 6.29 6.29l.95-.95a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/>
-        </svg>
+      <p style="font-size:13px;color:var(--text-muted);text-align:center;max-width:260px;" id="next-call-msg">Details have been saved. Ready for the next call.</p>
+      <button id="next-call-btn" style="padding:12px 32px;border-radius:24px;border:none;background:var(--accent);color:#fff;font-size:14px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:8px;">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 12 19.79 19.79 0 0 1 1.61 3.41 2 2 0 0 1 3.6 1.23h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 8.81a16 16 0 0 0 6.29 6.29l.95-.95a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
         Start Next Call
       </button>
     </div>
@@ -513,14 +511,14 @@ let turnStart = null, asrStart = null, llmStart = null, ttsStart = null;
 const audioQueue = [];
 let playbackActive = false;
 
-// ── Silence detection ─────────────────────────────────────────────
-// After a Transcribe final result, we wait SILENCE_TIMEOUT ms before
-// committing end_of_audio. Any new speech (by energy or another final
-// result) resets the timer so mid-sentence pauses don't cut the user off.
-const SILENCE_TIMEOUT   = 3500;   // ms to wait after last final result
-const SPEECH_ENERGY_THRESHOLD = 8; // 0-255 average energy; below = silence
-let silenceTimer        = null;
-let lastSpeechAt        = 0;      // timestamp of last detected audio energy
+
+
+
+
+
+
+
+
 
 // ─── DOM ──────────────────────────────────────────────────────────
 const micBtn    = document.getElementById('mic-btn');
@@ -582,42 +580,18 @@ function connect() {
   };
 }
 
-// Opens a fresh WS for the current sessionId, then fires bot_start once open.
-function connectAndStart() {
-  ws = new WebSocket(`${WS_URL}/${sessionId}`);
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = async () => {
-    setStatus('connected', 'Connected');
-    showToast('Connected');
-    await getAudioCtx().resume();
-    botTurnComplete = false;
-    ws.send(JSON.stringify({ type: 'bot_start' }));
-  };
-  ws.onclose = () => { setStatus('', 'Disconnected'); setTimeout(connect, 3000); };
-  ws.onerror = () => { setStatus('error', 'Error'); showToast('Connection error', 'error'); };
-
-  ws.onmessage = (evt) => {
-    if (typeof evt.data === 'string') {
-      handleControl(JSON.parse(evt.data));
-    } else {
-      handleAudioChunk(evt.data);
-    }
-  };
-}
-
 function handleControl(msg) {
   switch (msg.type) {
     case 'asr_result':
       appendMessage('user', msg.text);
       asrStart && updateMetric('m-asr', Date.now() - asrStart);
       llmStart = Date.now();
-      // Don't stop recording immediately — user may be mid-thought.
-      // Reset the silence timer so we wait another 2.5s from this point.
-      if (recording) {
-        micLabel.textContent = 'Keep talking or pause to send...';
-        scheduleSilenceEnd();
-      }
+      // Stop mic while bot is responding
+      if (recording) stopRecording();
+
+
+
+
       showTyping();
       break;
 
@@ -633,7 +607,9 @@ function handleControl(msg) {
       turnStart = null;
       removeTyping();
       botTurnComplete = true;
-      if (!playbackActive && ws && ws.readyState === WebSocket.OPEN && !recording) {
+      // Don't start mic here if audio is still playing —
+      // drainQueue will handle it once the queue fully empties
+      if (!playbackActive && !audioQueue.length && ws && ws.readyState === WebSocket.OPEN && !recording) {
         botTurnComplete = false;
         startRecording();
       }
@@ -642,18 +618,22 @@ function handleControl(msg) {
     case 'session_ended':
       if (msg.slots) renderSlots(msg.slots);
       showToast('Call ended — details saved', 'success');
-      if (recording) stopRecording();
+      // Stop mic without sending end_of_audio — session already over
+      recording = false;
+      micBtn.classList.remove('recording');
+      micLabel.textContent = 'Call ended';
+      resetViz();
+      if (processor)   { processor.disconnect();  processor   = null; }
+      if (analyser)    { analyser.disconnect();   analyser    = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+      // Flush audio queue so drainQueue can't restart the mic
+      audioQueue.length = 0;
+      playbackActive = false;
+      // Close WS so nothing can restart the mic
+      if (ws) { ws.onclose = null; ws.close(); ws = null; }
       micBtn.disabled = true;
       endBtn.disabled = true;
-      // Show the next-call overlay
-      {
-        const overlay = document.getElementById('next-call-overlay');
-        const msg2    = document.getElementById('next-call-msg');
-        msg2.textContent = msg.bot_initiated
-          ? 'Tiffany has ended the call. Details saved. Ready for the next one.'
-          : 'Details have been saved. Ready for the next call.';
-        overlay.classList.add('show');
-      }
+      document.getElementById('next-call-overlay').style.display = 'flex';
       break;
 
     case 'error':
@@ -701,7 +681,8 @@ function handleAudioChunk(buffer) {
 async function drainQueue() {
   if (!audioQueue.length) {
     playbackActive = false;
-    if (ws && ws.readyState === WebSocket.OPEN && !recording) {
+    // If turn_end already arrived while audio was playing, start mic now
+    if (botTurnComplete && ws && ws.readyState === WebSocket.OPEN && !recording) {
       botTurnComplete = false;
       setTimeout(() => startRecording(), 300);
     }
@@ -757,12 +738,12 @@ async function startRecording() {
     analyser.getByteFrequencyData(vizData);
     updateViz(vizData);
 
-    // Track whether the user is actively speaking so the silence timer
-    // doesn't fire during a natural mid-sentence pause with audible sound.
-    const avgEnergy = vizData.reduce((a, b) => a + b, 0) / vizData.length;
-    if (avgEnergy > SPEECH_ENERGY_THRESHOLD) {
-      lastSpeechAt = Date.now();
-    }
+
+
+
+
+
+
 
     const f32 = e.inputBuffer.getChannelData(0);
     const i16 = new Int16Array(f32.length);
@@ -773,35 +754,35 @@ async function startRecording() {
   };
 
   recording = true;
-  lastSpeechAt = Date.now();
+
   turnStart = Date.now();
   asrStart = Date.now();
   micBtn.classList.add('recording');
   micLabel.textContent = 'Listening...';
 }
 
-// ── Silence timer helpers ─────────────────────────────────────────
-function scheduleSilenceEnd() {
-  cancelSilenceTimer();
-  silenceTimer = setTimeout(() => {
-    // Double-check: if audio energy was detected recently, push the timer out
-    if (Date.now() - lastSpeechAt < SILENCE_TIMEOUT) {
-      scheduleSilenceEnd();
-      return;
-    }
-    if (recording) {
-      micLabel.textContent = 'Processing...';
-      stopRecording();
-    }
-  }, SILENCE_TIMEOUT);
-}
 
-function cancelSilenceTimer() {
-  if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 function stopRecording() {
-  cancelSilenceTimer();
+
   recording = false;
   micBtn.classList.remove('recording');
   micLabel.textContent = 'Waiting for bot...';
@@ -842,43 +823,43 @@ endBtn.addEventListener('click', async () => {
 
 // ─── Start Next Call button ───────────────────────────────────────
 document.getElementById('next-call-btn').addEventListener('click', async () => {
-  // Hide next-call overlay
-  document.getElementById('next-call-overlay').classList.remove('show');
+  document.getElementById('next-call-overlay').style.display = 'none';
 
-  // Generate fresh session ID
+  // Fresh session ID
   sessionId = crypto.randomUUID().slice(0, 8);
   document.getElementById('session-id').textContent = sessionId;
 
-  // Clear chat transcript
+  // Clear chat
   messages.innerHTML = '';
   botBubble = null;
-
-  // Reset slot panel
-  document.querySelectorAll('.slot-item').forEach(el => {
-    el.className = 'slot-item optional';
-    el.querySelector('.slot-icon').textContent = '○';
-    const valEl = el.querySelector('.slot-value');
-    if (valEl) { valEl.textContent = '—'; valEl.className = 'slot-value empty'; }
-  });
-  document.getElementById('slot-complete-banner').classList.remove('show');
-
-  // Re-enable controls
-  micBtn.disabled  = false;
-  endBtn.disabled  = false;
 
   // Reset metrics
   ['m-asr','m-llm','m-tts','m-total'].forEach(id => {
     document.getElementById(id).textContent = '—';
   });
 
-  // Close old WS (onclose auto-reconnect will fire with new sessionId)
-  // But we want to start immediately — open manually with new session ID.
-  if (ws) { ws.onclose = null; ws.close(); }
+  // Reset state
   audioQueue.length = 0;
   playbackActive = false;
+  botTurnComplete = false;
+  recording = false;
 
-  // Connect fresh WebSocket then start the bot
-  connectAndStart();
+  // Close old AudioContext
+  if (audioContext) {
+    try { await audioContext.close(); } catch (_) {}
+    audioContext = null;
+  }
+
+  // Re-enable controls
+  micBtn.disabled = false;
+  endBtn.disabled = false;
+  micLabel.textContent = 'Auto-listen on';
+
+  // Show start overlay for new call
+  document.getElementById('start-overlay').style.display = 'flex';
+
+  // Reconnect WebSocket
+  connect();
 });
 
 // ─── Mute ─────────────────────────────────────────────────────────
@@ -1015,4 +996,3 @@ loginBtn.addEventListener('click', () => { if (newPasswordPending) doNewPassword
 connect();
 </script>
 </body>
-</html>
