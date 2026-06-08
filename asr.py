@@ -87,6 +87,10 @@ class ASRStream:
                 await asyncio.wait_for(self._handler_task, timeout=5.0)
             except asyncio.TimeoutError:
                 log.warning("[ASR] Handler task timeout")
+            except Exception as e:
+                # Transcribe sends BadRequestException if no audio arrived for 15s
+                # (happens when VAD held audio back). Treat as normal stream close.
+                log.warning(f"[ASR] Handler task ended with Transcribe exception: {e}")
             self._handler_task = None
 
         self._stream = None

@@ -158,6 +158,15 @@ class VoicePipeline:
             log.info(f"[{self.session_id}] Bot-initiated end — running end_session automatically")
             await self.end_session(bot_initiated=True)
 
+    async def handle_silence_timeout(self):
+        """User didn't speak — bot gently prompts them."""
+        async with self._bot_turn_lock:
+            log.info(f"[{self.session_id}] Silence timeout — prompting user")
+            self._current_bot_response = []
+            self._bot_speaking = True
+            await self.llm.stream_response("USER_SILENT")
+            await self._on_turn_complete()
+
     async def bot_start(self):
         async with self._bot_turn_lock:
             self.session.clear()

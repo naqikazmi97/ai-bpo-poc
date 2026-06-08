@@ -240,30 +240,6 @@
     }
     .slot-complete-banner.show { display: flex; }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /* Session bar */
     .session-bar {
       width: 100%; max-width: 700px; margin-top: 12px;
@@ -500,16 +476,45 @@ const SAMPLE_RATE = 16000;
 // ─── State ────────────────────────────────────────────────────────
 let ws = null;
 let botTurnComplete = false;
+let pendingBotStart = false;
+let silenceTimer = null;
+let pendingSessionEnd = false;
+let pendingSessionSlots = null;
 let mediaStream = null;
 let audioContext = null;
 let processor = null;
 let analyser = null;
 let recording = false;
 let muted = false;
+let vizRafId = null;
 let sessionId = crypto.randomUUID().slice(0, 8);
 let turnStart = null, asrStart = null, llmStart = null, ttsStart = null;
 const audioQueue = [];
 let playbackActive = false;
+
+// ─── AudioWorklet processor (replaces deprecated ScriptProcessorNode) ─
+const WORKLET_CODE = `
+class PCMProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._buf = [];
+  }
+  process(inputs) {
+    const ch = inputs[0]?.[0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) this._buf.push(ch[i]);
+    while (this._buf.length >= 4096) {
+      const chunk = this._buf.splice(0, 4096);
+      const i16 = new Int16Array(4096);
+      for (let i = 0; i < 4096; i++)
+        i16[i] = Math.max(-32768, Math.min(32767, chunk[i] * 32768));
+      this.port.postMessage({ type: 'audio', buf: i16.buffer }, [i16.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
 
 
 
@@ -567,6 +572,10 @@ function connect() {
   ws.onopen = () => {
     setStatus('connected', 'Connected');
     showToast('Connected');
+    if (pendingBotStart) {
+      pendingBotStart = false;
+      ws.send(JSON.stringify({ type: 'bot_start' }));
+    }
   };
   ws.onclose = () => { setStatus('', 'Disconnected'); setTimeout(connect, 3000); };
   ws.onerror = () => { setStatus('error', 'Error'); showToast('Connection error', 'error'); };
@@ -583,6 +592,8 @@ function connect() {
 function handleControl(msg) {
   switch (msg.type) {
     case 'asr_result':
+      clearTimeout(silenceTimer);
+      silenceTimer = null;
       appendMessage('user', msg.text);
       asrStart && updateMetric('m-asr', Date.now() - asrStart);
       llmStart = Date.now();
@@ -616,24 +627,23 @@ function handleControl(msg) {
       break;
 
     case 'session_ended':
-      if (msg.slots) renderSlots(msg.slots);
-      showToast('Call ended — details saved', 'success');
-      // Stop mic without sending end_of_audio — session already over
+      // Mark session end pending — let any in-flight audio finish before showing overlay
+      pendingSessionSlots = msg.slots || null;
+      pendingSessionEnd = true;
+      clearTimeout(silenceTimer);
+      silenceTimer = null;
+      // Stop mic
       recording = false;
-      micBtn.classList.remove('recording');
-      micLabel.textContent = 'Call ended';
-      resetViz();
+      stopVizLoop();
       if (processor)   { processor.disconnect();  processor   = null; }
       if (analyser)    { analyser.disconnect();   analyser    = null; }
       if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-      // Flush audio queue so drainQueue can't restart the mic
-      audioQueue.length = 0;
-      playbackActive = false;
-      // Close WS so nothing can restart the mic
+      // Close WS so no new audio arrives, but keep audioQueue draining
       if (ws) { ws.onclose = null; ws.close(); ws = null; }
       micBtn.disabled = true;
       endBtn.disabled = true;
-      document.getElementById('next-call-overlay').style.display = 'flex';
+      // If nothing is playing, show overlay immediately; otherwise drainQueue handles it
+      if (!playbackActive && !audioQueue.length) finishSessionEnd();
       break;
 
     case 'error':
@@ -672,6 +682,17 @@ function renderSlots(slots) {
 }
 
 // ─── Audio playback ───────────────────────────────────────────────
+function finishSessionEnd() {
+  pendingSessionEnd = false;
+  if (pendingSessionSlots) renderSlots(pendingSessionSlots);
+  pendingSessionSlots = null;
+  showToast('Call ended — details saved', 'success');
+  micBtn.classList.remove('recording');
+  micLabel.textContent = 'Call ended';
+  resetViz();
+  document.getElementById('next-call-overlay').style.display = 'flex';
+}
+
 function handleAudioChunk(buffer) {
   if (muted) return;
   audioQueue.push(buffer);
@@ -681,6 +702,8 @@ function handleAudioChunk(buffer) {
 async function drainQueue() {
   if (!audioQueue.length) {
     playbackActive = false;
+    // Bot said goodbye — show overlay now that audio has finished
+    if (pendingSessionEnd) { finishSessionEnd(); return; }
     // If turn_end already arrived while audio was playing, start mic now
     if (botTurnComplete && ws && ws.readyState === WebSocket.OPEN && !recording) {
       botTurnComplete = false;
@@ -709,6 +732,21 @@ function getAudioCtx() {
   return audioContext;
 }
 
+// ─── Visualizer loop (rAF-based, decoupled from audio thread) ─────────
+function startVizLoop() {
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  function loop() {
+    if (!recording) return;
+    analyser.getByteFrequencyData(data);
+    updateViz(data);
+    vizRafId = requestAnimationFrame(loop);
+  }
+  vizRafId = requestAnimationFrame(loop);
+}
+function stopVizLoop() {
+  if (vizRafId) { cancelAnimationFrame(vizRafId); vizRafId = null; }
+}
+
 // ─── Microphone ───────────────────────────────────────────────────
 async function startRecording() {
   botTurnComplete = false;
@@ -722,68 +760,52 @@ async function startRecording() {
   }
 
   const ctx = getAudioCtx();
+
+  if (!ctx._workletLoaded) {
+    const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    ctx._workletLoaded = true;
+  }
+
   const source = ctx.createMediaStreamSource(mediaStream);
   analyser = ctx.createAnalyser();
   analyser.fftSize = 64;
   source.connect(analyser);
 
-  processor = ctx.createScriptProcessor(4096, 1, 1);
+  processor = new AudioWorkletNode(ctx, 'pcm-processor');
   source.connect(processor);
-  processor.connect(ctx.destination);
 
-  const vizData = new Uint8Array(analyser.frequencyBinCount);
-
-  processor.onaudioprocess = (e) => {
+  processor.port.onmessage = (e) => {
     if (!recording) return;
-    analyser.getByteFrequencyData(vizData);
-    updateViz(vizData);
-
-
-
-
-
-
-
-
-    const f32 = e.inputBuffer.getChannelData(0);
-    const i16 = new Int16Array(f32.length);
-    for (let i = 0; i < f32.length; i++) {
-      i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+    if (e.data.type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(e.data.buf);
     }
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(i16.buffer);
   };
 
   recording = true;
+  micBtn.classList.add('recording');
+  micLabel.textContent = 'Listening...';
+  startVizLoop();
+
+  // If the user doesn't speak within 10 seconds, prompt them
+  silenceTimer = setTimeout(() => {
+    silenceTimer = null;
+    if (recording && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'silence_timeout' }));
+    }
+  }, 10000);
 
   turnStart = Date.now();
   asrStart = Date.now();
-  micBtn.classList.add('recording');
-  micLabel.textContent = 'Listening...';
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 function stopRecording() {
-
+  clearTimeout(silenceTimer);
+  silenceTimer = null;
   recording = false;
+  stopVizLoop();
   micBtn.classList.remove('recording');
   micLabel.textContent = 'Waiting for bot...';
   resetViz();
@@ -802,6 +824,8 @@ document.getElementById('start-call-btn').addEventListener('click', async () => 
   botTurnComplete = false;
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'bot_start' }));
+  } else {
+    pendingBotStart = true;
   }
 });
 
@@ -842,7 +866,12 @@ document.getElementById('next-call-btn').addEventListener('click', async () => {
   audioQueue.length = 0;
   playbackActive = false;
   botTurnComplete = false;
+  pendingBotStart = false;
+  pendingSessionEnd = false;
+  pendingSessionSlots = null;
   recording = false;
+  clearTimeout(silenceTimer);
+  silenceTimer = null;
 
   // Close old AudioContext
   if (audioContext) {

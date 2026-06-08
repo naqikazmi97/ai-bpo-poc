@@ -2,6 +2,7 @@
 main.py — FastAPI WebSocket entry point
 Run with: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
 """
+import asyncio
 import json
 import logging
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -48,6 +49,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 elif data.get("type") == "bot_start":
                     await pipeline.bot_start()
 
+                elif data.get("type") == "silence_timeout":
+                    asyncio.ensure_future(pipeline.handle_silence_timeout())
+
                 elif data.get("type") == "end_session":
                     # Explicit end — client pressed "end call"
                     # Triggers extraction before disconnect
@@ -58,9 +62,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
     except WebSocketDisconnect:
         log.info(f"[{session_id}] WebSocket disconnected")
+    except RuntimeError as e:
+        if "disconnect message" in str(e):
+            # Client closed WS after bot-initiated session_ended — normal
+            log.info(f"[{session_id}] WebSocket closed after bot-initiated end")
+        else:
+            log.error(f"[{session_id}] Unexpected error: {e}", exc_info=True)
     except Exception as e:
         log.error(f"[{session_id}] Unexpected error: {e}", exc_info=True)
     finally:
-        # If client dropped without sending end_session,
-        # cleanup() still runs extraction as a safety net
-        await pipeline.cleanup(already_ended=session_ended)
+        # Use _extraction_done to cover bot-initiated ends where session_ended flag wasn't set
+        await pipeline.cleanup(already_ended=session_ended or pipeline._extraction_done)

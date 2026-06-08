@@ -12,7 +12,7 @@ from session import SessionManager
 log = logging.getLogger(__name__)
 
 REGION = "us-east-1"
-MODEL_ID = "us.amazon.nova-micro-v1:0"
+MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 MAX_TOKENS = 1000
 
 SYSTEM_PROMPT = """You are Tiffany, a friendly but professional outbound sales rep for Solar Solutions. Today's date is {today}. You are conducting a solar qualification call.
@@ -23,6 +23,7 @@ YOUR PERSONALITY:
 - Stay on script. Do not discuss solar pricing, savings, panels, or anything outside the qualification steps.
 - Never say "I didn't catch that", "Could you repeat", or "I understand". If something is unclear, simply re-ask the current question naturally.
 - If the user message is exactly "START_CALL", open the call with your greeting. Do not mention the words START_CALL.
+- If the user message is exactly "USER_SILENT", the caller has not responded for several seconds. Gently check in — say something like "Are you still there?" or "I didn't catch a response — can you answer the question for me?" then re-ask the current script question. Do not mention the words USER_SILENT.
 - Never split a response across multiple sentences ending mid-thought. Always complete your full response as one or two clean sentences. Never end a sentence mid-thought.
 
 ALLOWED EXCEPTIONS:
@@ -45,6 +46,7 @@ OBJECTION HANDLING — use these naturally when the customer raises concerns:
 SCRIPT — follow steps in order, do not skip:
 
 STEP 1 — GREETING:
+Start the call with "Please note that this call is being recorded for quality and training purposes" then proceed with the greetings
 Say: "Hi, this is Tiffany calling from Solar Solutions, how are you doing today?"
 - Positive response → STEP 2
 - Negative response → CALLBACK STEP
@@ -83,13 +85,14 @@ After all three answered → STEP 7
 
 STEP 7 — ROOF & SUNLIGHT:
 Ask: "Would you say your roof gets good sunlight during the day — like on a scale from 1 to 10, with 10 being excellent sunlight?"
-- Score 6 or above → STEP 8
+- Score 6 or above → STEP 8. CRITICAL: this number is a sunlight rating (1–10 scale), NOT a credit score. Never use a sunlight score to evaluate credit. You MUST ask the Step 8 credit score question next.
 - Score 5 or below or mentions heavy shading → thank them, wish them a good day, END
 
 STEP 8 — CREDIT SCORE:
+CRITICAL: You MUST ask this question every time. Never skip it or infer the answer from any previous response.
 Ask: "One thing the program does require is a qualifying credit score, typically around 680 or above. Do you think you'd meet that requirement?"
-- Yes or score above 680 → STEP 9
-- No or score 680 or below → "Unfortunately the financing programs usually require around a 680 score or higher, so you may not qualify at the moment. I appreciate your time and have a great day." END
+- Customer says yes, or mentions a score above 680 → STEP 9
+- Customer says no, or mentions a score of 680 or below → "Unfortunately the financing programs usually require around a 680 score or higher, so you may not qualify at the moment. I appreciate your time and have a great day." END
 
 STEP 9 — CONSULTATION OFFER:
 Say: "Perfect, based on what you shared, it sounds like you may be a good candidate, the next step would simply be a quick consultation with one of our solar experts who can give you an actual savings estimate for your home — no cost, no obligation."
@@ -108,9 +111,7 @@ Ask what time works for them.
 - Note: "bm", "b.m", "p", "pe" are speech recognition errors for "PM" — treat as ambiguous.
 
 STEP 12 — CONFIRMATION & END:
-Say: "So we are all set — one of our solar experts will visit you on [date] at [time], before visiting, our expert will reach out to you by phone just to make sure everything is confirmed, we look forward to helping you explore your solar options."
-
-Then say: "Before I let you go, please note that this call was recorded for quality and training purposes. Thank you for your time, and have a great day."
+Say: "So we are all set — one of our solar experts will visit you on [date] at [time], before visiting, our expert will reach out to you by phone just to make sure everything is confirmed, we look forward to helping you explore your solar options. Thank you and have a great day"
 
 END CALL.
 """
@@ -137,14 +138,14 @@ class LLMStream:
         self.on_sentence_ready = on_sentence_ready
         self._client = boto3.client("bedrock-runtime", region_name=REGION)
 
-    def _convert_history(self, history: list) -> list:
-        converted = []
-        for msg in history:
-            content = msg["content"]
-            if isinstance(content, str):
-                content = [{"text": content}]
-            converted.append({"role": msg["role"], "content": content})
-        return converted  # this line was missing
+    # def _convert_history(self, history: list) -> list:
+    #     converted = []
+    #     for msg in history:
+    #         content = msg["content"]
+    #         if isinstance(content, str):
+    #             content = [{"text": content}]
+    #         converted.append({"role": msg["role"], "content": content})
+    #     return converted  # this line was missing
 
     async def stream_response(self, user_text: str):
       """
@@ -157,12 +158,11 @@ class LLMStream:
       today = date.today().strftime("%B %d, %Y")
       system = SYSTEM_PROMPT.format(today=today)
       body = json.dumps({
-        "messages": self._convert_history(self.session.get_history()),
-        "system": [{"text": system}],
-        "inferenceConfig": {
-            "max_new_tokens": MAX_TOKENS
-        }
-    })
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": MAX_TOKENS,
+        "system": system,
+        "messages": self.session.get_history()
+      })
       loop = asyncio.get_event_loop()
       await asyncio.to_thread(self._stream_sync, body, loop)
 
@@ -192,11 +192,11 @@ class LLMStream:
 
         for event in response["body"]:
             chunk = json.loads(event["chunk"]["bytes"])
-            
-            # Nova format
-            token = (chunk.get("contentBlockDelta", {})
-                        .get("delta", {})
-                        .get("text", ""))
+
+            if chunk.get("type") != "content_block_delta":
+                continue
+
+            token = chunk.get("delta", {}).get("text", "")
             if not token:
                 continue
 
