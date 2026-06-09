@@ -456,9 +456,6 @@
       </div>
     </div>
   </div>
-
-
-
 </div>
 
 <div class="session-bar">
@@ -485,30 +482,69 @@ let audioContext = null;
 let processor = null;
 let analyser = null;
 let recording = false;
+let stopping = false;       // true while stopRecording flush is in progress
 let muted = false;
 let vizRafId = null;
 let sessionId = crypto.randomUUID().slice(0, 8);
 let turnStart = null, asrStart = null, llmStart = null, ttsStart = null;
 const audioQueue = [];
 let playbackActive = false;
+// Echo-cancellation routing: bot audio plays through a MediaStreamDestination
+// so the browser's AEC sees it as the loudspeaker reference signal.
+let audioDestNode = null;
+let audioElement = null;
+// Interim user bubble shown while Transcribe partials arrive
+let interimBubble = null;
 
-// ─── AudioWorklet processor (replaces deprecated ScriptProcessorNode) ─
+// ─── AudioWorklet processor with resampling to 16kHz ─
+// Browsers often capture at 48kHz but Transcribe expects 16kHz PCM.
+// We resample on the audio thread to prevent pitch distortion.
 const WORKLET_CODE = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this._buf = [];
+    this._inputRate = sampleRate;
+    this._outputRate = 16000;
+    this._ratio = this._inputRate / this._outputRate;
+    // Emit every 20ms of output audio (320 samples at 16kHz) so Transcribe
+    // receives frequent small chunks rather than one large 256ms burst.
+    this._chunkIn = Math.ceil(320 * this._ratio);
+    this.port.onmessage = (e) => {
+      if (e.data.type === 'flush') this._flush();
+    };
+  }
+  _send(samples) {
+    const outLen = Math.floor(samples.length / this._ratio);
+    if (outLen === 0) return;
+    const outF32 = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcIdx = i * this._ratio;
+      const idx0 = Math.floor(srcIdx);
+      const frac = srcIdx - idx0;
+      const s0 = samples[idx0] || 0;
+      const s1 = samples[Math.min(idx0 + 1, samples.length - 1)] || 0;
+      outF32[i] = s0 + (s1 - s0) * frac;
+    }
+    const i16 = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++)
+      i16[i] = Math.max(-32768, Math.min(32767, outF32[i] * 32768));
+    this.port.postMessage({ type: 'audio', buf: i16.buffer }, [i16.buffer]);
+  }
+  _flush() {
+    if (this._buf.length > 0) {
+      this._send(this._buf);
+      this._buf = [];
+    }
+    this.port.postMessage({ type: 'flushed' });
   }
   process(inputs) {
     const ch = inputs[0]?.[0];
     if (!ch) return true;
     for (let i = 0; i < ch.length; i++) this._buf.push(ch[i]);
-    while (this._buf.length >= 4096) {
-      const chunk = this._buf.splice(0, 4096);
-      const i16 = new Int16Array(4096);
-      for (let i = 0; i < 4096; i++)
-        i16[i] = Math.max(-32768, Math.min(32767, chunk[i] * 32768));
-      this.port.postMessage({ type: 'audio', buf: i16.buffer }, [i16.buffer]);
+    while (this._buf.length >= this._chunkIn) {
+      this._send(this._buf.slice(0, this._chunkIn));
+      this._buf.splice(0, this._chunkIn);
     }
     return true;
   }
@@ -591,9 +627,17 @@ function connect() {
 
 function handleControl(msg) {
   switch (msg.type) {
+    case 'asr_partial':
+      // User is actively speaking — reset the silence timer and show interim text
+      clearTimeout(silenceTimer);
+      silenceTimer = null;
+      showInterimText(msg.text);
+      break;
+
     case 'asr_result':
       clearTimeout(silenceTimer);
       silenceTimer = null;
+      clearInterimText();
       appendMessage('user', msg.text);
       asrStart && updateMetric('m-asr', Date.now() - asrStart);
       llmStart = Date.now();
@@ -632,6 +676,7 @@ function handleControl(msg) {
       pendingSessionEnd = true;
       clearTimeout(silenceTimer);
       silenceTimer = null;
+      clearInterimText();
       // Stop mic
       recording = false;
       stopVizLoop();
@@ -720,7 +765,7 @@ async function drainQueue() {
   buf.copyToChannel(f32, 0);
   const src = ctx.createBufferSource();
   src.buffer = buf;
-  src.connect(ctx.destination);
+  src.connect(audioDestNode);   // routes through MediaStream → Audio element → EC
   src.onended = drainQueue;
   src.start();
 }
@@ -728,6 +773,13 @@ async function drainQueue() {
 function getAudioCtx() {
   if (!audioContext || audioContext.state === 'closed') {
     audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+    // Route all bot playback through a MediaStreamDestination node so the
+    // browser's echo canceller (getUserMedia echoCancellation:true) can use
+    // it as the loudspeaker reference signal and cancel it from mic input.
+    audioDestNode = audioContext.createMediaStreamDestination();
+    audioElement = new Audio();
+    audioElement.srcObject = audioDestNode.stream;
+    audioElement.play().catch(() => {});
   }
   return audioContext;
 }
@@ -749,6 +801,9 @@ function stopVizLoop() {
 
 // ─── Microphone ───────────────────────────────────────────────────
 async function startRecording() {
+  // Don't open the mic while a previous stopRecording flush is still draining —
+  // that would create two concurrent audio sources feeding the same WebSocket.
+  if (stopping) return;
   botTurnComplete = false;
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: {
@@ -760,6 +815,9 @@ async function startRecording() {
   }
 
   const ctx = getAudioCtx();
+  // Resume if the browser auto-suspended the context between turns
+  // (Chrome suspends AudioContext during periods with no active nodes).
+  if (ctx.state === 'suspended') await ctx.resume();
 
   if (!ctx._workletLoaded) {
     const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
@@ -801,20 +859,39 @@ async function startRecording() {
   asrStart = Date.now();
 }
 
-function stopRecording() {
+async function stopRecording() {
   clearTimeout(silenceTimer);
   silenceTimer = null;
   recording = false;
+  stopping = true;        // block startRecording until flush is complete
   stopVizLoop();
   micBtn.classList.remove('recording');
   micLabel.textContent = 'Waiting for bot...';
   resetViz();
-  if (processor)    { processor.disconnect(); processor = null; }
-  if (analyser)     { analyser.disconnect();  analyser  = null; }
-  if (mediaStream)  { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (processor) {
+    // Flush any samples still buffered in the worklet (up to ~20ms tail)
+    // before disconnecting, so Transcribe gets the full utterance.
+    await new Promise(resolve => {
+      const t = setTimeout(resolve, 200);
+      processor.port.onmessage = (e) => {
+        if (e.data.type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(e.data.buf);
+        } else if (e.data.type === 'flushed') {
+          clearTimeout(t);
+          resolve();
+        }
+      };
+      processor.port.postMessage({ type: 'flush' });
+    });
+    processor.disconnect();
+    processor = null;
+  }
+  if (analyser)    { analyser.disconnect();  analyser  = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'end_of_audio' }));
   }
+  stopping = false;   // flush complete — startRecording may proceed
 }
 
 // ─── Start Call button ────────────────────────────────────────────
@@ -822,6 +899,14 @@ document.getElementById('start-call-btn').addEventListener('click', async () => 
   await getAudioCtx().resume();
   document.getElementById('start-overlay').style.display = 'none';
   botTurnComplete = false;
+
+  // Log actual sample rate for debugging
+  const actualRate = audioContext ? audioContext.sampleRate : 'unknown';
+  console.log(`[Audio] AudioContext sample rate: ${actualRate} (target: ${SAMPLE_RATE})`);
+  if (actualRate !== SAMPLE_RATE && actualRate !== 'unknown') {
+    console.warn(`[Audio] SAMPLE RATE MISMATCH! AudioContext is ${actualRate}, Transcribe expects ${SAMPLE_RATE}. Worklet resampling will handle this.`);
+  }
+
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'bot_start' }));
   } else {
@@ -837,7 +922,7 @@ micBtn.addEventListener('click', () => {
 // ─── End Call button ──────────────────────────────────────────────
 endBtn.addEventListener('click', async () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) { showToast('Not connected', 'error'); return; }
-  if (recording) stopRecording();
+  if (recording) await stopRecording();
   audioQueue.length = 0;
   playbackActive = false;
   ws.send(JSON.stringify({ type: 'end_session' }));
@@ -870,13 +955,17 @@ document.getElementById('next-call-btn').addEventListener('click', async () => {
   pendingSessionEnd = false;
   pendingSessionSlots = null;
   recording = false;
+  stopping = false;
+  clearInterimText();
   clearTimeout(silenceTimer);
   silenceTimer = null;
 
-  // Close old AudioContext
+  // Close old AudioContext (and its MediaStreamDestination/element)
   if (audioContext) {
     try { await audioContext.close(); } catch (_) {}
     audioContext = null;
+    audioDestNode = null;
+    if (audioElement) { audioElement.srcObject = null; audioElement = null; }
   }
 
   // Re-enable controls
@@ -914,6 +1003,30 @@ function appendMessage(role, text) {
 }
 
 let botBubble = null;
+
+// ─── Interim user text (asr_partial) ─────────────────────────────
+// Shows a greyed-out user bubble while Transcribe partials stream in,
+// giving the user live feedback that their voice is being captured.
+// Replaced by the real bubble when asr_result commits.
+function showInterimText(text) {
+  if (!interimBubble) {
+    const div = document.createElement('div');
+    div.className = 'message user';
+    div.innerHTML = '<div class="avatar">You</div>'
+      + '<div class="bubble" style="opacity:0.45;font-style:italic;" id="interim-bbl"></div>';
+    messages.appendChild(div);
+    interimBubble = document.getElementById('interim-bbl');
+    interimBubble.removeAttribute('id');
+  }
+  interimBubble.textContent = text;
+  messages.scrollTop = messages.scrollHeight;
+}
+function clearInterimText() {
+  if (interimBubble) {
+    interimBubble.closest('.message')?.remove();
+    interimBubble = null;
+  }
+}
 function appendBotText(text) {
   removeTyping();
   if (!botBubble) {

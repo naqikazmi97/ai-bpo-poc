@@ -13,14 +13,18 @@ REGION = "us-east-1"
 TABLE_NAME = "ai-bpo-poc"
 MAX_HISTORY_TURNS = 10   # Keep last 10 turns to control token count
 
+# Module-level resource — boto3 resources are thread-safe and reusable,
+# so share one across all sessions instead of one per WebSocket connection.
+_dynamodb = boto3.resource("dynamodb", region_name=REGION)
+_table = _dynamodb.Table(TABLE_NAME)
+
 
 class SessionManager:
     def __init__(self, session_id: str):
         self.session_id = session_id
         self._history = []
         self._slots = {}
-        self._dynamodb = boto3.resource("dynamodb", region_name=REGION)
-        self._table = self._dynamodb.Table(TABLE_NAME)
+        self._table = _table
         self._load()
 
     # ── Load / Save ───────────────────────────────────────────────

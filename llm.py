@@ -8,11 +8,12 @@ import logging
 import boto3
 from datetime import date
 from session import SessionManager
+from providers import match_provider
 
 log = logging.getLogger(__name__)
 
 REGION = "us-east-1"
-MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 MAX_TOKENS = 1000
 
 SYSTEM_PROMPT = """You are Tiffany, a friendly but professional outbound sales rep for Solar Solutions. Today's date is {today}. You are conducting a solar qualification call.
@@ -79,6 +80,9 @@ Ask: "Can you help me with your physical address including the city and zip code
 STEP 6 — UTILITY & USAGE:
 Ask the following one at a time:
 1. "Who's your current electric provider?"
+   - As soon as the customer names a provider, call the check_electric_provider tool to validate it. Do NOT decide on your own whether a provider qualifies, and never read any provider list out loud.
+   - If the tool returns valid, briefly acknowledge using the returned canonical name, then continue to question 2.
+   - If the tool returns not valid, tell the customer that isn't a provider we currently work with and politely ask them to confirm their electric provider again, then validate the new answer with the tool. Do NOT advance to question 2 until the tool confirms a valid provider.
 2. "How high do your electricity bills usually get during summer months?"
 3. "Are you currently receiving any discounts or solar credits on your electricity bill?"
 After all three answered → STEP 7
@@ -116,7 +120,7 @@ Say: "So we are all set — one of our solar experts will visit you on [date] at
 END CALL.
 """
 
-SENTENCE_ENDINGS = {'.', '?'}
+SENTENCE_ENDINGS = {'.', '?', '!'}
 
 # Sentinel emitted after the bot's closing sentence so the pipeline
 # can trigger end_session automatically.
@@ -126,107 +130,228 @@ END_CALL_SENTINEL = "__END_CALL__"
 # Matched case-insensitively against the accumulated full response.
 END_CALL_PHRASES = [
     "thank you for your time",
-    "I hope your day gets better",
-    "I hope you have a great day",
+    "i hope your day gets better",
+    "i hope you have a great day",
     "have a great day",
+    "have a wonderful day",
+    "have a good day",
+    "take care",
+    "appreciate your time",
+    "wish you all the best",
+    "enjoy the rest of your day",
 ]
+
+# Module-level client — boto3 clients are thread-safe and reusable,
+# so share one across all sessions instead of one per WebSocket connection.
+_bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+
+# ── Tools ─────────────────────────────────────────────
+# The supported electric-provider list lives in providers.py, NOT in the
+# system prompt. The model calls this tool during STEP 6 to validate whatever
+# provider the customer names; the actual matching happens in match_provider().
+PROVIDER_TOOL = {
+    "name": "check_electric_provider",
+    "description": (
+        "Validate the electric utility provider the customer named against the "
+        "list of providers the solar program supports. Call this in STEP 6 as "
+        "soon as the customer names their electric provider, before replying. "
+        "Pass the provider name exactly as the customer said it. Returns "
+        "{\"valid\": true, \"canonical_name\": \"...\"} if supported, or "
+        "{\"valid\": false} if the provider is not in the supported list."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "provider_name": {
+                "type": "string",
+                "description": "The electric provider name as stated by the customer.",
+            }
+        },
+        "required": ["provider_name"],
+    },
+}
+
+TOOLS = [PROVIDER_TOOL]
 
 
 class LLMStream:
     def __init__(self, session: SessionManager, on_sentence_ready):
         self.session = session
         self.on_sentence_ready = on_sentence_ready
-        self._client = boto3.client("bedrock-runtime", region_name=REGION)
-
-    # def _convert_history(self, history: list) -> list:
-    #     converted = []
-    #     for msg in history:
-    #         content = msg["content"]
-    #         if isinstance(content, str):
-    #             content = [{"text": content}]
-    #         converted.append({"role": msg["role"], "content": content})
-    #     return converted  # this line was missing
+        self._client = _bedrock_client
 
     async def stream_response(self, user_text: str):
-      """
-      Stream a response from Bedrock.
-      Calls on_sentence_ready once per complete sentence
-      without waiting for the full response.
-      """
-      self.session.add_user_message(user_text)
-      log.info(f"[LLM] Full history being sent: {self.session.get_history()}")
-      today = date.today().strftime("%B %d, %Y")
-      system = SYSTEM_PROMPT.format(today=today)
-      body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": MAX_TOKENS,
-        "system": system,
-        "messages": self.session.get_history()
-      })
-      loop = asyncio.get_event_loop()
-      await asyncio.to_thread(self._stream_sync, body, loop)
+        """
+        Stream a response from Bedrock.
+        Calls on_sentence_ready once per complete sentence without waiting
+        for the full response. Tool-use round-trips (e.g. electric-provider
+        validation) are resolved inside the turn and are NOT persisted to
+        session history — only the spoken text is.
+        """
+        self.session.add_user_message(user_text)
+        log.info(f"[LLM] Full history being sent: {self.session.get_history()}")
+        today = date.today().strftime("%B %d, %Y")
+        system = SYSTEM_PROMPT.format(today=today)
+        messages = self.session.get_history()
+        loop = asyncio.get_event_loop()
+        await asyncio.to_thread(self._stream_sync, system, messages, loop)
 
-    def _stream_sync(self, body: str, loop):
+    def _run_tool(self, name: str, tool_input: dict) -> str:
+        """Execute a tool call. Returns a JSON string for the tool_result."""
+        if name == "check_electric_provider":
+            spoken = (tool_input or {}).get("provider_name", "")
+            canonical = match_provider(spoken)
+            if canonical:
+                log.info(f"[LLM] Provider {spoken!r} matched -> {canonical!r}")
+                return json.dumps({"valid": True, "canonical_name": canonical})
+            log.info(f"[LLM] Provider {spoken!r} not in supported list")
+            return json.dumps({"valid": False})
+        log.warning(f"[LLM] Unknown tool requested: {name}")
+        return json.dumps({"error": f"unknown tool {name}"})
+
+    def _stream_sync(self, system: str, messages: list, loop):
         """
         Blocking Bedrock stream handler.
         Runs in a thread via asyncio.to_thread.
-        Fires on_sentence_ready per complete sentence.
-        """
-        try:
-            response = self._client.invoke_model_with_response_stream(
-                modelId=MODEL_ID,
-                contentType="application/json",
-                accept="application/json",
-                body=body
-            )
-        except Exception as e:
-            log.error(f"[LLM] Bedrock error: {e}")
-            asyncio.run_coroutine_threadsafe(
-                self.on_sentence_ready("I'm sorry, I ran into an error. Please try again."),
-                loop
-            ).result(timeout=5.0)
-            return
+        Fires on_sentence_ready per complete sentence and resolves any tool
+        calls in a loop before finishing the turn.
 
+        `messages` is copied and mutated locally for tool round-trips only;
+        it is never written back to session history.
+        """
+        messages = list(messages)
         sentence_buf = ""
         full_response = ""
 
-        for event in response["body"]:
-            chunk = json.loads(event["chunk"]["bytes"])
+        while True:
+            body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": MAX_TOKENS,
+                "system": system,
+                "messages": messages,
+                "tools": TOOLS,
+            })
 
-            if chunk.get("type") != "content_block_delta":
-                continue
+            try:
+                response = self._client.invoke_model_with_response_stream(
+                    modelId=MODEL_ID,
+                    contentType="application/json",
+                    accept="application/json",
+                    body=body,
+                )
+            except Exception as e:
+                log.error(f"[LLM] Bedrock error: {e}")
+                self._emit("I'm sorry, I ran into an error. Please try again.", loop)
+                return
 
-            token = chunk.get("delta", {}).get("text", "")
-            if not token:
-                continue
+            blocks = {}          # index -> accumulated content block
+            stop_reason = None
 
-            sentence_buf += token
-            full_response += token
+            for event in response["body"]:
+                chunk = json.loads(event["chunk"]["bytes"])
+                etype = chunk.get("type")
 
-            # Detect sentence boundary
-            if sentence_buf.rstrip() and sentence_buf.rstrip()[-1] in SENTENCE_ENDINGS:
-                sentence = sentence_buf.strip()
-                if sentence:
-                    log.debug(f"[LLM] Sentence: {sentence}")
-                    asyncio.run_coroutine_threadsafe(
-                        self.on_sentence_ready(sentence),
-                        loop
-                    ).result(timeout=5.0)
-                sentence_buf = ""
+                if etype == "content_block_start":
+                    idx = chunk["index"]
+                    cb = chunk.get("content_block", {})
+                    if cb.get("type") == "tool_use":
+                        blocks[idx] = {
+                            "type": "tool_use",
+                            "id": cb.get("id"),
+                            "name": cb.get("name"),
+                            "json": "",
+                        }
+                    else:
+                        blocks[idx] = {"type": "text", "text": ""}
+
+                elif etype == "content_block_delta":
+                    idx = chunk["index"]
+                    delta = chunk.get("delta", {})
+                    dtype = delta.get("type")
+
+                    if dtype == "text_delta":
+                        token = delta.get("text", "")
+                        if not token:
+                            continue
+                        blocks.setdefault(idx, {"type": "text", "text": ""})
+                        blocks[idx]["text"] += token
+                        sentence_buf += token
+                        full_response += token
+                        if sentence_buf.rstrip() and sentence_buf.rstrip()[-1] in SENTENCE_ENDINGS:
+                            sentence = sentence_buf.strip()
+                            if sentence:
+                                log.debug(f"[LLM] Sentence: {sentence}")
+                                self._emit(sentence, loop)
+                            sentence_buf = ""
+
+                    elif dtype == "input_json_delta":
+                        blk = blocks.setdefault(
+                            idx, {"type": "tool_use", "id": None, "name": None, "json": ""}
+                        )
+                        blk["json"] += delta.get("partial_json", "")
+
+                elif etype == "message_delta":
+                    stop_reason = chunk.get("delta", {}).get("stop_reason", stop_reason)
+
+            # ── Tool round-trip ──────────────────────────
+            if stop_reason == "tool_use":
+                # Speak anything the model said before the tool call (normally none).
+                if sentence_buf.strip():
+                    self._emit(sentence_buf.strip(), loop)
+                    sentence_buf = ""
+
+                assistant_content = []
+                tool_results = []
+                for idx in sorted(blocks):
+                    b = blocks[idx]
+                    if b["type"] == "text" and b["text"]:
+                        assistant_content.append({"type": "text", "text": b["text"]})
+                    elif b["type"] == "tool_use":
+                        try:
+                            tool_input = json.loads(b["json"]) if b["json"] else {}
+                        except json.JSONDecodeError:
+                            tool_input = {}
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": b["id"],
+                            "name": b["name"],
+                            "input": tool_input,
+                        })
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": b["id"],
+                            "content": self._run_tool(b["name"], tool_input),
+                        })
+
+                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append({"role": "user", "content": tool_results})
+                continue  # re-invoke so the model continues with the tool result
+
+            # ── Normal completion ──────────────────────
+            break
 
         # Flush any trailing text (incomplete sentence)
         if sentence_buf.strip():
-            asyncio.run_coroutine_threadsafe(
-                self.on_sentence_ready(sentence_buf.strip()),
-                loop
-            ).result(timeout=5.0)
+            self._emit(sentence_buf.strip(), loop)
 
         # After all sentences are emitted, check if this was the closing turn.
         # If so, send the sentinel so the pipeline can end the session.
         full_response_lower = full_response.lower()
         if any(phrase in full_response_lower for phrase in END_CALL_PHRASES):
             log.info("[LLM] End-of-call phrase detected — emitting END_CALL sentinel")
+            self._emit(END_CALL_SENTINEL, loop)
+
+    def _emit(self, sentence: str, loop):
+        """
+        Hand a sentence to on_sentence_ready on the event loop thread.
+        Logged and swallowed on timeout/error so a slow downstream callback
+        (TTS/websocket) can't crash the stream thread mid-call and leave
+        the pipeline's turn lock held.
+        """
+        try:
             asyncio.run_coroutine_threadsafe(
-                self.on_sentence_ready(END_CALL_SENTINEL),
+                self.on_sentence_ready(sentence),
                 loop
             ).result(timeout=5.0)
+        except Exception as e:
+            log.error(f"[LLM] on_sentence_ready failed for {sentence!r}: {e}")
