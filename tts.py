@@ -40,8 +40,6 @@ class TTSStream:
         await self._queue.put(sentence)
 
     async def _worker(self):
-        pending_audio = None  # pre-fetched audio for next sentence
-
         while self._running:
             try:
                 sentence = await asyncio.wait_for(self._queue.get(), timeout=1.0)
@@ -49,39 +47,16 @@ class TTSStream:
                 continue
 
             if sentence is None:
+                self._queue.task_done()
                 break
 
             try:
-                next_task = None
-
-                if pending_audio is not None:
-                    audio = pending_audio
-                    pending_audio = None
-                else:
-                    audio = await asyncio.to_thread(self._synthesize_sync, sentence)
-
+                audio = await asyncio.to_thread(self._synthesize_sync, sentence)
+                log.info(f"[TTS] Synthesized {len(audio)} bytes for: {sentence[:40]!r}")
                 if not audio:
                     log.error(f"[TTS] Polly returned empty audio for: {sentence!r}")
                 else:
-                    # Peek at the next item and pre-fetch it in parallel
-                    try:
-                        next_sentence = self._queue.get_nowait()
-                        if next_sentence is not None:
-                            next_task = asyncio.create_task(
-                                asyncio.to_thread(self._synthesize_sync, next_sentence)
-                            )
-                        else:
-                            self._queue.task_done()
-                    except asyncio.QueueEmpty:
-                        next_sentence = None
-
                     await self.on_audio_ready(audio)
-
-                    if next_task is not None:
-                        pending_audio = await next_task
-                        self._queue.task_done()
-                        await self._queue.put(next_sentence)
-
             except Exception as e:
                 log.error(f"[TTS] Synthesis error for {sentence!r}: {e}", exc_info=True)
             finally:

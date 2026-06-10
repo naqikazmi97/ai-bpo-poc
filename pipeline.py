@@ -82,11 +82,14 @@ class VoicePipeline:
     async def end_audio(self):
         """Client signalled end of speech turn."""
         log.info(f"[{self.session_id}] End of audio signal")
-        # The turn is being committed/ended — stop any pending timer and drop
-        # unflushed segments so they can't trigger a stray extra turn.
         self._reset_utterance_state()
-        await self.asr.end_stream()
+        # Set False BEFORE end_stream. The handler task runs inside end_stream
+        # and can fire late finals; _on_asr_final/_on_asr_partial check this
+        # flag and bail out, preventing a stale commit timer from arming and
+        # later sending a ghost asr_result that closes the next turn's stream.
         self._asr_started = False
+        await self.asr.end_stream()
+        self._reset_utterance_state()  # belt-and-suspenders: cancel any timer that slipped through
 
     async def clear_session(self):
         """Reset conversation history — does not trigger extraction."""
@@ -164,6 +167,8 @@ class VoicePipeline:
         truncate the tail. Also forward to the frontend so it can show interim
         text and reset its silence timer while the user is actively speaking.
         """
+        if not self._asr_started:
+            return
         self._partial_pending = True
         self._last_partial_text = text
         self._grace_rounds = 0
@@ -175,6 +180,9 @@ class VoicePipeline:
         Transcribe finalized a SEGMENT (not necessarily the whole turn).
         Buffer it and wait for silence before committing the turn.
         """
+        if not self._asr_started:
+            log.debug(f"[{self.session_id}] Discarding late final (stream ended): {text!r}")
+            return
         self._utterance_parts.append(text)
         self._partial_pending = False
         self._last_partial_text = ""
@@ -188,6 +196,11 @@ class VoicePipeline:
         in which case we wait a little longer for the final (anti-truncation).
         """
         self._commit_handle = None
+
+        # Guard: timer may have been armed just before end_audio() set _asr_started=False.
+        if not self._asr_started:
+            log.debug(f"[{self.session_id}] Stale commit discarded (turn ended)")
+            return
 
         # A partial arrived after the last final and hasn't finalized yet —
         # the user's last words are still being recognized. Give it more time
@@ -254,6 +267,7 @@ class VoicePipeline:
 
     async def _send_audio(self, audio_bytes: bytes):
         """Send PCM audio chunk to client as binary WebSocket frame."""
+        log.info(f"[Pipeline] Sending audio chunk: {len(audio_bytes)} bytes")
         await self.websocket.send_bytes(audio_bytes)
 
     async def _send_control(self, payload: dict):
@@ -280,7 +294,14 @@ class VoicePipeline:
             await self.end_session(bot_initiated=True)
 
     async def handle_silence_timeout(self):
-        """User didn't speak — bot gently prompts them."""
+        self._reset_utterance_state()
+        # Cleanly close the ASR stream before starting bot response.
+        # The frontend sends end_of_audio after silence_timeout, but it can
+        # race with this coroutine. Close it here explicitly so the stream
+        # is always torn down before the next one opens.
+        if self._asr_started:
+            self._asr_started = False
+            await self.asr.end_stream()
         async with self._bot_turn_lock:
             log.info(f"[{self.session_id}] Silence timeout — prompting user")
             self._current_bot_response = []

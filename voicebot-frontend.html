@@ -485,6 +485,7 @@ let recording = false;
 let stopping = false;       // true while stopRecording flush is in progress
 let muted = false;
 let vizRafId = null;
+let micStartPending = false;
 let sessionId = crypto.randomUUID().slice(0, 8);
 let turnStart = null, asrStart = null, llmStart = null, ttsStart = null;
 const audioQueue = [];
@@ -499,67 +500,58 @@ let interimBubble = null;
 // ─── AudioWorklet processor with resampling to 16kHz ─
 // Browsers often capture at 48kHz but Transcribe expects 16kHz PCM.
 // We resample on the audio thread to prevent pitch distortion.
-const WORKLET_CODE = `
-class PCMProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this._buf = [];
-    this._inputRate = sampleRate;
-    this._outputRate = 16000;
-    this._ratio = this._inputRate / this._outputRate;
-    // Emit every 20ms of output audio (320 samples at 16kHz) so Transcribe
-    // receives frequent small chunks rather than one large 256ms burst.
-    this._chunkIn = Math.ceil(320 * this._ratio);
-    this.port.onmessage = (e) => {
-      if (e.data.type === 'flush') this._flush();
-    };
-  }
-  _send(samples) {
-    const outLen = Math.floor(samples.length / this._ratio);
-    if (outLen === 0) return;
-    const outF32 = new Float32Array(outLen);
-    for (let i = 0; i < outLen; i++) {
-      const srcIdx = i * this._ratio;
-      const idx0 = Math.floor(srcIdx);
-      const frac = srcIdx - idx0;
-      const s0 = samples[idx0] || 0;
-      const s1 = samples[Math.min(idx0 + 1, samples.length - 1)] || 0;
-      outF32[i] = s0 + (s1 - s0) * frac;
-    }
-    const i16 = new Int16Array(outLen);
-    for (let i = 0; i < outLen; i++)
-      i16[i] = Math.max(-32768, Math.min(32767, outF32[i] * 32768));
-    this.port.postMessage({ type: 'audio', buf: i16.buffer }, [i16.buffer]);
-  }
-  _flush() {
-    if (this._buf.length > 0) {
-      this._send(this._buf);
-      this._buf = [];
-    }
-    this.port.postMessage({ type: 'flushed' });
-  }
-  process(inputs) {
-    const ch = inputs[0]?.[0];
-    if (!ch) return true;
-    for (let i = 0; i < ch.length; i++) this._buf.push(ch[i]);
-    while (this._buf.length >= this._chunkIn) {
-      this._send(this._buf.slice(0, this._chunkIn));
-      this._buf.splice(0, this._chunkIn);
-    }
-    return true;
-  }
-}
-registerProcessor('pcm-processor', PCMProcessor);
-`;
-
-
-
-
-
-
-
-
-
+// const WORKLET_CODE = `
+// class PCMProcessor extends AudioWorkletProcessor {
+//   constructor() {
+//     super();
+//     this._buf = [];
+//     this._inputRate = sampleRate;
+//     this._outputRate = 16000;
+//     this._ratio = this._inputRate / this._outputRate;
+//     // Emit every 20ms of output audio (320 samples at 16kHz) so Transcribe
+//     // receives frequent small chunks rather than one large 256ms burst.
+//     this._chunkIn = Math.ceil(320 * this._ratio);
+//     this.port.onmessage = (e) => {
+//       if (e.data.type === 'flush') this._flush();
+//     };
+//   }
+//   _send(samples) {
+//     const outLen = Math.floor(samples.length / this._ratio);
+//     if (outLen === 0) return;
+//     const outF32 = new Float32Array(outLen);
+//     for (let i = 0; i < outLen; i++) {
+//       const srcIdx = i * this._ratio;
+//       const idx0 = Math.floor(srcIdx);
+//       const frac = srcIdx - idx0;
+//       const s0 = samples[idx0] || 0;
+//       const s1 = samples[Math.min(idx0 + 1, samples.length - 1)] || 0;
+//       outF32[i] = s0 + (s1 - s0) * frac;
+//     }
+//     const i16 = new Int16Array(outLen);
+//     for (let i = 0; i < outLen; i++)
+//       i16[i] = Math.max(-32768, Math.min(32767, outF32[i] * 32768));
+//     this.port.postMessage({ type: 'audio', buf: i16.buffer }, [i16.buffer]);
+//   }
+//   _flush() {
+//     if (this._buf.length > 0) {
+//       this._send(this._buf);
+//       this._buf = [];
+//     }
+//     this.port.postMessage({ type: 'flushed' });
+//   }
+//   process(inputs) {
+//     const ch = inputs[0]?.[0];
+//     if (!ch) return true;
+//     for (let i = 0; i < ch.length; i++) this._buf.push(ch[i]);
+//     while (this._buf.length >= this._chunkIn) {
+//       this._send(this._buf.slice(0, this._chunkIn));
+//       this._buf.splice(0, this._chunkIn);
+//     }
+//     return true;
+//   }
+// }
+// registerProcessor('pcm-processor', PCMProcessor);
+// `;
 
 // ─── DOM ──────────────────────────────────────────────────────────
 const micBtn    = document.getElementById('mic-btn');
@@ -641,13 +633,10 @@ function handleControl(msg) {
       appendMessage('user', msg.text);
       asrStart && updateMetric('m-asr', Date.now() - asrStart);
       llmStart = Date.now();
-      // Stop mic while bot is responding
-      if (recording) stopRecording();
-
-
-
-
-      showTyping();
+      // Stop mic (and await flush) before bot audio starts, so AEC doesn't
+      // process the bot's voice differently than the initial greeting.
+      if (recording) stopRecording().then(() => showTyping());
+      else showTyping();
       break;
 
     case 'llm_sentence':
@@ -657,6 +646,7 @@ function handleControl(msg) {
       break;
 
     case 'turn_end':
+      console.log('[TURN] turn_end received, playbackActive:', playbackActive, 'queueLen:', audioQueue.length);
       ttsStart  && updateMetric('m-tts',   Date.now() - ttsStart);
       turnStart && updateMetric('m-total', Date.now() - turnStart);
       turnStart = null;
@@ -747,12 +737,11 @@ function handleAudioChunk(buffer) {
 async function drainQueue() {
   if (!audioQueue.length) {
     playbackActive = false;
-    // Bot said goodbye — show overlay now that audio has finished
     if (pendingSessionEnd) { finishSessionEnd(); return; }
-    // If turn_end already arrived while audio was playing, start mic now
-    if (botTurnComplete && ws && ws.readyState === WebSocket.OPEN && !recording) {
+    if (botTurnComplete && ws && ws.readyState === WebSocket.OPEN && !recording && !micStartPending) {
       botTurnComplete = false;
-      setTimeout(() => startRecording(), 300);
+      micStartPending = true;
+      setTimeout(() => { micStartPending = false; startRecording(); }, 300);
     }
     return;
   }
@@ -765,7 +754,7 @@ async function drainQueue() {
   buf.copyToChannel(f32, 0);
   const src = ctx.createBufferSource();
   src.buffer = buf;
-  src.connect(audioDestNode);   // routes through MediaStream → Audio element → EC
+  src.connect(audioDestNode);
   src.onended = drainQueue;
   src.start();
 }
@@ -773,13 +762,20 @@ async function drainQueue() {
 function getAudioCtx() {
   if (!audioContext || audioContext.state === 'closed') {
     audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-    // Route all bot playback through a MediaStreamDestination node so the
-    // browser's echo canceller (getUserMedia echoCancellation:true) can use
-    // it as the loudspeaker reference signal and cancel it from mic input.
     audioDestNode = audioContext.createMediaStreamDestination();
     audioElement = new Audio();
     audioElement.srcObject = audioDestNode.stream;
     audioElement.play().catch(() => {});
+    // Keep the AudioContext from auto-suspending between bot turns.
+    // A ConstantSource at 0 amplitude is inaudible but counts as an active
+    // source node, preventing Chrome from suspending the context.  Without
+    // this, the context suspends after step-1 audio ends, and the resume()
+    // inside drainQueue causes the step-2 audio to start through a cold
+    // processing pipeline, producing the audible "voice change" artifact.
+    const keepAlive = audioContext.createConstantSource();
+    keepAlive.offset.value = 0;
+    keepAlive.connect(audioDestNode);
+    keepAlive.start();
   }
   return audioContext;
 }
@@ -803,13 +799,16 @@ function stopVizLoop() {
 async function startRecording() {
   // Don't open the mic while a previous stopRecording flush is still draining —
   // that would create two concurrent audio sources feeding the same WebSocket.
-  if (stopping) return;
+  console.log('[MIC] startRecording called, stopping:', stopping, 'recording:', recording);
+  micStartPending = false;
+  if (stopping) { console.warn('[MIC] blocked by stopping flag'); return; }
   botTurnComplete = false;
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: {
       sampleRate: SAMPLE_RATE, channelCount: 1,
       echoCancellation: true, noiseSuppression: true, autoGainControl: true
     }});
+    console.log('[MIC] getUserMedia success, tracks:', mediaStream.getAudioTracks().length);
   } catch {
     showToast('Microphone access denied', 'error'); return;
   }
@@ -819,28 +818,33 @@ async function startRecording() {
   // (Chrome suspends AudioContext during periods with no active nodes).
   if (ctx.state === 'suspended') await ctx.resume();
 
-  if (!ctx._workletLoaded) {
-    const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
-    const url = URL.createObjectURL(blob);
-    await ctx.audioWorklet.addModule(url);
-    URL.revokeObjectURL(url);
-    ctx._workletLoaded = true;
-  }
+  // if (!ctx._workletLoaded) {
+  //   const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+  //   const url = URL.createObjectURL(blob);
+  //   await ctx.audioWorklet.addModule(url);
+  //   URL.revokeObjectURL(url);
+  //   ctx._workletLoaded = true;
+  // }
 
   const source = ctx.createMediaStreamSource(mediaStream);
   analyser = ctx.createAnalyser();
   analyser.fftSize = 64;
   source.connect(analyser);
 
-  processor = new AudioWorkletNode(ctx, 'pcm-processor');
-  source.connect(processor);
-
-  processor.port.onmessage = (e) => {
-    if (!recording) return;
-    if (e.data.type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(e.data.buf);
-    }
+  processor = ctx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (e) => {
+      if (!recording) return;
+      const f32 = e.inputBuffer.getChannelData(0);
+      const i16 = new Int16Array(f32.length);
+      for (let i = 0; i < f32.length; i++) {
+          i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(i16.buffer);
+      }
   };
+  source.connect(processor);
+  processor.connect(ctx.destination);
 
   recording = true;
   micBtn.classList.add('recording');
@@ -852,6 +856,10 @@ async function startRecording() {
     silenceTimer = null;
     if (recording && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'silence_timeout' }));
+      // Stop recording so the ASR stream is cleanly closed. Without this,
+      // recording stays true across the bot's silence-prompt response and
+      // drainQueue/turn_end never call startRecording() again.
+      stopRecording();
     }
   }, 10000);
 
@@ -860,29 +868,17 @@ async function startRecording() {
 }
 
 async function stopRecording() {
+  console.log('[MIC] stopRecording called');
   clearTimeout(silenceTimer);
   silenceTimer = null;
   recording = false;
   stopping = true;        // block startRecording until flush is complete
+  console.log('[MIC] stopping cleared');
   stopVizLoop();
   micBtn.classList.remove('recording');
   micLabel.textContent = 'Waiting for bot...';
   resetViz();
   if (processor) {
-    // Flush any samples still buffered in the worklet (up to ~20ms tail)
-    // before disconnecting, so Transcribe gets the full utterance.
-    await new Promise(resolve => {
-      const t = setTimeout(resolve, 200);
-      processor.port.onmessage = (e) => {
-        if (e.data.type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(e.data.buf);
-        } else if (e.data.type === 'flushed') {
-          clearTimeout(t);
-          resolve();
-        }
-      };
-      processor.port.postMessage({ type: 'flush' });
-    });
     processor.disconnect();
     processor = null;
   }
@@ -959,6 +955,7 @@ document.getElementById('next-call-btn').addEventListener('click', async () => {
   clearInterimText();
   clearTimeout(silenceTimer);
   silenceTimer = null;
+  micStartPending = false;
 
   // Close old AudioContext (and its MediaStreamDestination/element)
   if (audioContext) {

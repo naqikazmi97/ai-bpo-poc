@@ -18,7 +18,7 @@ LANGUAGE_CODE = "en-US"
 class _TranscribeHandler(TranscriptResultStreamHandler):
     """
     Receives transcript events from Transcribe.
-    Fires on_utterance_ready only on FINAL (non-partial) results.
+    Fires on_partial for partial results and on_utterance_ready for finals.
     """
     def __init__(self, stream, on_utterance_ready, on_partial=None):
         super().__init__(stream)
@@ -28,19 +28,15 @@ class _TranscribeHandler(TranscriptResultStreamHandler):
 
     async def handle_transcript_event(self, transcript_event: TranscriptEvent):
         results = transcript_event.transcript.results
-
         for result in results:
             if not result.alternatives:
                 continue
-
             transcript = result.alternatives[0].transcript.strip()
             if not transcript:
                 continue
 
             if result.is_partial:
                 self._partial_buffer = transcript
-                # Forward partials so the pipeline can treat ongoing speech as
-                # activity and hold the turn open (endpointing).
                 if self.on_partial:
                     await self.on_partial(transcript)
             else:
@@ -50,125 +46,84 @@ class _TranscribeHandler(TranscriptResultStreamHandler):
 
 
 class ASRStream:
-    def __init__(self, on_utterance_ready, on_partial=None, sample_rate=SAMPLE_RATE):
+    def __init__(self, on_utterance_ready, on_partial=None):
         self.on_utterance_ready = on_utterance_ready
         self.on_partial = on_partial
         self._client = TranscribeStreamingClient(region=REGION)
         self._stream = None
         self._handler_task = None
-        self._sample_rate = sample_rate
-        # Tracking for audio validation
-        self._total_bytes_received = 0
-        self._chunk_count = 0
-        self._min_chunk = float("inf")
-        self._max_chunk = 0
+        # Bumped on every start(). end_stream() detaches from the handler task
+        # without cancelling it (see end_stream), so a previous session's task
+        # can keep running briefly in the background. Wrapping callbacks with
+        # the generation they were created under lets us discard any late
+        # events it fires after a new session has already started.
+        self._generation = 0
+
+    def is_active(self) -> bool:
+        """Return True if there is a live Transcribe stream with a running handler."""
+        return (
+            self._stream is not None
+            and self._handler_task is not None
+            and not self._handler_task.done()
+        )
+
+    def _guard(self, callback, generation):
+        """Wrap a callback so it's a no-op once a newer session has started."""
+        async def wrapped(text):
+            if generation != self._generation:
+                log.debug(f"[ASR] Discarding callback from stale session (gen {generation})")
+                return
+            await callback(text)
+        return wrapped
 
     async def start(self):
         """Open a new Transcribe streaming session."""
-        # Reset audio validation stats for the new stream
-        self._total_bytes_received = 0
-        self._chunk_count = 0
-        self._min_chunk = float("inf")
-        self._max_chunk = 0
-
-        # CRITICAL: Cancel any handler task from a PREVIOUS stream before
-        # starting a new one. If the old handler task is still running (e.g.
-        # waiting for trailing events from Transcribe after end_stream), it
-        # will fire on_utterance_ready / on_partial into the current pipeline
-        # callbacks — corrupting the new stream with stale events.
-        if self._handler_task is not None and not self._handler_task.done():
-            log.warning("[ASR] Cancelling stale handler task from previous stream")
-            self._handler_task.cancel()
-            try:
-                await asyncio.wait_for(self._handler_task, timeout=0.5)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-        self._handler_task = None
-
-        log.info(f"[ASR] Starting stream — sample_rate={self._sample_rate}, encoding=pcm")
+        # Create a fresh client for each session. The SDK reuses a single HTTP/2
+        # connection across all start_stream_transcription calls on the same client.
+        # After a few sessions the connection accumulates stale stream state and
+        # new sessions stop producing transcripts. A new client = new connection.
+        self._client = TranscribeStreamingClient(region=REGION)
         self._stream = await self._client.start_stream_transcription(
             language_code=LANGUAGE_CODE,
-            media_sample_rate_hz=self._sample_rate,
+            media_sample_rate_hz=SAMPLE_RATE,
             media_encoding="pcm",
             enable_partial_results_stabilization=True,
-            partial_results_stability="high",
+            partial_results_stability="medium",
         )
-
+        self._generation += 1
+        gen = self._generation
         handler = _TranscribeHandler(
             self._stream.output_stream,
-            self.on_utterance_ready,
-            self.on_partial,
+            self._guard(self.on_utterance_ready, gen),
+            self._guard(self.on_partial, gen) if self.on_partial else None,
         )
-
         self._handler_task = asyncio.create_task(handler.handle_events())
         log.info("[ASR] Stream started")
-
-    def is_active(self) -> bool:
-        """True when a live Transcribe stream is open and able to accept audio."""
-        return self._stream is not None
 
     async def feed(self, audio_chunk: bytes):
         """Push a raw PCM chunk into Transcribe."""
         if self._stream:
-            # ── Audio validation ─────────────────────────────────────
-            self._total_bytes_received += len(audio_chunk)
-            self._chunk_count += 1
-            self._min_chunk = min(self._min_chunk, len(audio_chunk))
-            self._max_chunk = max(self._max_chunk, len(audio_chunk))
-
-            # PCM at sample_rate: each sample = 2 bytes (16-bit)
-            # Expected chunk sizes are multiples of frame boundaries
-            bytes_per_ms = self._sample_rate * 2 // 1000  # e.g. 32 at 16kHz
-            if len(audio_chunk) % 2 != 0:
-                log.warning(f"[ASR] Odd-sized chunk ({len(audio_chunk)} bytes) — possible corruption")
-            if len(audio_chunk) < bytes_per_ms * 10:
-                log.warning(f"[ASR] Very small chunk ({len(audio_chunk)} bytes, <10ms)")
-
             await self._stream.input_stream.send_audio_event(
                 audio_chunk=audio_chunk
             )
 
     async def end_stream(self):
-        """Signal end of audio to Transcribe."""
+        """Signal end of audio to Transcribe and detach from the handler.
+
+        Transcribe doesn't close its output stream promptly after EOS, so
+        waiting for the handler task to finish naturally stalls every turn.
+        We don't cancel it either — cancelling while awscrt's C thread is
+        mid-delivery of a chunk races the same future and raises a logged
+        (but otherwise harmless) InvalidStateError on every turn. Instead we
+        just detach: the task keeps running until Transcribe closes the
+        stream on its own, and the generation guard in start() (plus the
+        _asr_started checks in pipeline.py) discard anything it fires after
+        this point.
+        """
         if self._stream:
             await self._stream.input_stream.end_stream()
             log.info("[ASR] Stream ended")
-
-        # Log audio validation summary
-        if self._chunk_count > 0:
-            avg_chunk = self._total_bytes_received / self._chunk_count
-            log.info(
-                f"[ASR] Audio stats: {self._chunk_count} chunks, "
-                f"{self._total_bytes_received} total bytes, "
-                f"min={self._min_chunk}, max={self._max_chunk}, "
-                f"avg={avg_chunk:.0f}"
-            )
-
-        if self._handler_task:
-            try:
-                # Short timeout — don't block the pipeline for more than 500ms.
-                # The handler task may be waiting for Transcribe's final events;
-                # those are best-effort and not worth blocking a new stream for.
-                await asyncio.wait_for(self._handler_task, timeout=0.5)
-            except asyncio.TimeoutError:
-                # Transcribe still hasn't closed the output stream. CANCEL the
-                # handler here instead of orphaning it: once we null the
-                # reference below, start()'s stale-handler guard can no longer
-                # see it, so an orphaned task would keep firing stale
-                # on_utterance_ready / on_partial events into the NEXT turn's
-                # pipeline — producing phantom asr_results that desync the mic
-                # handshake and leave subsequent audio untranscribed.
-                self._handler_task.cancel()
-                try:
-                    await self._handler_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            except Exception as e:
-                # Transcribe sends BadRequestException if no audio arrived for 15s
-                # (happens when VAD held audio back). Treat as normal stream close.
-                log.debug(f"[ASR] Handler task ended: {e}")
-            self._handler_task = None
-
+        self._handler_task = None
         self._stream = None
 
     async def stop(self):
@@ -178,7 +133,5 @@ class ASRStream:
                 await self._stream.input_stream.end_stream()
             except Exception:
                 pass
-        if self._handler_task:
-            self._handler_task.cancel()
-        self._stream = None
         self._handler_task = None
+        self._stream = None
